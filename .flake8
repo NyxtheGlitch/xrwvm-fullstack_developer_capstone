@@ -1,3 +1,5 @@
 [flake8]
 exclude = node_modules, djangoenv, migrations, .git, __pycache__
 max-line-length = 79
+per-file-ignores =
+    server/djangoproj/settings.py: E501
