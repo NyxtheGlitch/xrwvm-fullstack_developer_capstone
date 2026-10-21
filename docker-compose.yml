@@ -1,0 +1,54 @@
+# Production-style stack: all four services on one private Docker network.
+# Run from this folder with:  docker compose up -d --build
+name: dealerships
+
+services:
+  # MongoDB: stores dealers and reviews.
+  # No "ports:" on purpose. Only containers on this compose network can
+  # reach it (by the hostname "mongo_db"). Nothing outside Docker can.
+  mongo_db:
+    image: mongo:7.0
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+
+  # Express API in front of MongoDB (REST: /fetchDealers, /fetchReviews...).
+  # Also unpublished; only the Django container calls it.
+  api:
+    build: ./server/database
+    restart: unless-stopped
+    depends_on:
+      - mongo_db
+
+  # Flask sentiment microservice (VADER). Flask listens on port 5000.
+  sentiment:
+    build: ./server/djangoapp/microservices
+    restart: unless-stopped
+
+  # Django: serves the React site and acts as the gateway to the others.
+  web:
+    build: ./server
+    restart: unless-stopped
+    depends_on:
+      - api
+      - sentiment
+    environment:
+      DJANGO_DEBUG: "false"
+      # ${VAR:?message} makes compose stop with that message if .env lacks it.
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?Set DJANGO_SECRET_KEY in .env}
+      DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:?Set DJANGO_ALLOWED_HOSTS in .env}
+      DJANGO_CSRF_TRUSTED_ORIGINS: ${DJANGO_CSRF_TRUSTED_ORIGINS:-}
+      SQLITE_PATH: /data/db.sqlite3
+      # Containers reach each other by service name, not localhost.
+      backend_url: http://api:3030
+      sentiment_analyzer_url: http://sentiment:5000/
+    volumes:
+      - django_data:/data
+    # Bound to 127.0.0.1: only this Pi itself can connect directly.
+    # Tailscale Serve will be the (HTTPS) front door from your tailnet.
+    ports:
+      - "127.0.0.1:8000:8000"
+
+volumes:
+  mongo_data:
+  django_data:

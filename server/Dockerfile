@@ -1,25 +1,40 @@
-    FROM python:3.12.0-slim-bookworm
+# ---------- Stage 1: build the React frontend ----------
+# This stage only exists to produce frontend/build. Node and all the
+# node_modules stay behind in this stage; they never reach the final image.
+FROM node:20-slim AS frontend-build
+WORKDIR /frontend
+COPY frontend/package*.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
 
-    ENV PYTHONUNBUFFERED 1
-    ENV PYTHONDONTWRITEBYTECODE 1
+# ---------- Stage 2: the Django app ----------
+FROM python:3.12-slim-bookworm
 
-    ENV APP=/app
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
 
-    # Change the workdir.
-    WORKDIR $APP
+WORKDIR /app
 
-    # Install the requirements
-    COPY requirements.txt $APP
+# Install dependencies first so Docker can cache this layer
+# when only the app code changes.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-    RUN pip3 install -r requirements.txt
+COPY . .
+COPY --from=frontend-build /frontend/build ./frontend/build
 
-    # Copy the rest of the files
-    COPY . $APP
+# Gather static files (including the React build) into /app/static.
+RUN python manage.py collectstatic --noinput
 
-    EXPOSE 8000
+# Run as a normal user instead of root. /data holds the SQLite database
+# and is where the compose file mounts a persistent volume.
+RUN useradd --create-home --uid 1000 app \
+    && mkdir /data \
+    && chown -R app:app /app /data
+USER app
 
-    RUN chmod +x /app/entrypoint.sh
+EXPOSE 8000
 
-    ENTRYPOINT ["/bin/bash","/app/entrypoint.sh"]
-
-    CMD ["gunicorn", "--bind", ":8000", "--workers", "3", "djangoproj.wsgi"]
+ENTRYPOINT ["/bin/bash", "/app/entrypoint.sh"]
+CMD ["gunicorn", "--bind", ":8000", "--workers", "3", "djangoproj.wsgi"]

@@ -1,0 +1,304 @@
+diff --git a/.env.example b/.env.example
+new file mode 100644
+index 0000000..b55392e
+--- /dev/null
++++ b/.env.example
+@@ -0,0 +1,13 @@
++# Copy to .env and fill in:  cp .env.example .env
++# .env is in .gitignore, so it never gets committed.
++
++# Generate with:  python3 -c "import secrets; print(secrets.token_urlsafe(50))"
++DJANGO_SECRET_KEY=change-me
++
++# Hostnames Django will answer to (comma-separated, no spaces needed).
++# Add your Pi's full Tailscale name once you know it.
++DJANGO_ALLOWED_HOSTS=localhost,127.0.0.1,glitch-pi
++
++# Full https:// origins that may submit forms (needed for the admin login).
++# Example: https://glitch-pi.your-tailnet.ts.net
++DJANGO_CSRF_TRUSTED_ORIGINS=
+diff --git a/docker-compose.yml b/docker-compose.yml
+new file mode 100644
+index 0000000..8257752
+--- /dev/null
++++ b/docker-compose.yml
+@@ -0,0 +1,54 @@
++# Production-style stack: all four services on one private Docker network.
++# Run from this folder with:  docker compose up -d --build
++name: dealerships
++
++services:
++  # MongoDB: stores dealers and reviews.
++  # No "ports:" on purpose. Only containers on this compose network can
++  # reach it (by the hostname "mongo_db"). Nothing outside Docker can.
++  mongo_db:
++    image: mongo:7.0
++    restart: unless-stopped
++    volumes:
++      - mongo_data:/data/db
++
++  # Express API in front of MongoDB (REST: /fetchDealers, /fetchReviews...).
++  # Also unpublished; only the Django container calls it.
++  api:
++    build: ./server/database
++    restart: unless-stopped
++    depends_on:
++      - mongo_db
++
++  # Flask sentiment microservice (VADER). Flask listens on port 5000.
++  sentiment:
++    build: ./server/djangoapp/microservices
++    restart: unless-stopped
++
++  # Django: serves the React site and acts as the gateway to the others.
++  web:
++    build: ./server
++    restart: unless-stopped
++    depends_on:
++      - api
++      - sentiment
++    environment:
++      DJANGO_DEBUG: "false"
++      # ${VAR:?message} makes compose stop with that message if .env lacks it.
++      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?Set DJANGO_SECRET_KEY in .env}
++      DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:?Set DJANGO_ALLOWED_HOSTS in .env}
++      DJANGO_CSRF_TRUSTED_ORIGINS: ${DJANGO_CSRF_TRUSTED_ORIGINS:-}
++      SQLITE_PATH: /data/db.sqlite3
++      # Containers reach each other by service name, not localhost.
++      backend_url: http://api:3030
++      sentiment_analyzer_url: http://sentiment:5000/
++    volumes:
++      - django_data:/data
++    # Bound to 127.0.0.1: only this Pi itself can connect directly.
++    # Tailscale Serve will be the (HTTPS) front door from your tailnet.
++    ports:
++      - "127.0.0.1:8000:8000"
++
++volumes:
++  mongo_data:
++  django_data:
+diff --git a/server/.dockerignore b/server/.dockerignore
+new file mode 100644
+index 0000000..39ea0fa
+--- /dev/null
++++ b/server/.dockerignore
+@@ -0,0 +1,10 @@
++# Keep local files out of the image: they are either secrets, rebuilt
++# inside the image, or built for a different CPU/OS than the container.
++.env
++**/.env
++.venv
++**/__pycache__
++db.sqlite3
++frontend/node_modules
++frontend/build
++static
+diff --git a/server/Dockerfile b/server/Dockerfile
+index 3506689..2f1cc2d 100644
+--- a/server/Dockerfile
++++ b/server/Dockerfile
+@@ -1,25 +1,40 @@
+-    FROM python:3.12.0-slim-bookworm
+-
+-    ENV PYTHONUNBUFFERED 1
+-    ENV PYTHONDONTWRITEBYTECODE 1
+-
+-    ENV APP=/app
+-
+-    # Change the workdir.
+-    WORKDIR $APP
+-
+-    # Install the requirements
+-    COPY requirements.txt $APP
+-
+-    RUN pip3 install -r requirements.txt
+-
+-    # Copy the rest of the files
+-    COPY . $APP
+-
+-    EXPOSE 8000
+-
+-    RUN chmod +x /app/entrypoint.sh
+-
+-    ENTRYPOINT ["/bin/bash","/app/entrypoint.sh"]
+-
+-    CMD ["gunicorn", "--bind", ":8000", "--workers", "3", "djangoproj.wsgi"]
++# ---------- Stage 1: build the React frontend ----------
++# This stage only exists to produce frontend/build. Node and all the
++# node_modules stay behind in this stage; they never reach the final image.
++FROM node:20-slim AS frontend-build
++WORKDIR /frontend
++COPY frontend/package*.json ./
++RUN npm ci
++COPY frontend/ ./
++RUN npm run build
++
++# ---------- Stage 2: the Django app ----------
++FROM python:3.12-slim-bookworm
++
++ENV PYTHONUNBUFFERED=1 \
++    PYTHONDONTWRITEBYTECODE=1
++
++WORKDIR /app
++
++# Install dependencies first so Docker can cache this layer
++# when only the app code changes.
++COPY requirements.txt .
++RUN pip install --no-cache-dir -r requirements.txt
++
++COPY . .
++COPY --from=frontend-build /frontend/build ./frontend/build
++
++# Gather static files (including the React build) into /app/static.
++RUN python manage.py collectstatic --noinput
++
++# Run as a normal user instead of root. /data holds the SQLite database
++# and is where the compose file mounts a persistent volume.
++RUN useradd --create-home --uid 1000 app \
++    && mkdir /data \
++    && chown -R app:app /app /data
++USER app
++
++EXPOSE 8000
++
++ENTRYPOINT ["/bin/bash", "/app/entrypoint.sh"]
++CMD ["gunicorn", "--bind", ":8000", "--workers", "3", "djangoproj.wsgi"]
+diff --git a/server/database/.dockerignore b/server/database/.dockerignore
+new file mode 100644
+index 0000000..3c3629e
+--- /dev/null
++++ b/server/database/.dockerignore
+@@ -0,0 +1 @@
++node_modules
+diff --git a/server/djangoapp/microservices/Dockerfile b/server/djangoapp/microservices/Dockerfile
+index b30bf82..ca65f51 100644
+--- a/server/djangoapp/microservices/Dockerfile
++++ b/server/djangoapp/microservices/Dockerfile
+@@ -1,10 +1,14 @@
+-FROM python:3.9.18-slim-bookworm
+-
+-
+-WORKDIR /python-docker
+-
+-COPY requirements.txt requirements.txt
+-RUN pip3 install -r requirements.txt
+-COPY . .
+-RUN ls
+-CMD [ "python3", "-m" , "flask", "run", "--host=0.0.0.0"]
++FROM python:3.9.18-slim-bookworm
++
++
++WORKDIR /python-docker
++
++COPY requirements.txt requirements.txt
++RUN pip3 install -r requirements.txt
++
++# The sentiment model's word list. Without it the service crashes on start.
++RUN python -m nltk.downloader -d /usr/local/share/nltk_data vader_lexicon
++
++COPY . .
++RUN ls
++CMD [ "python3", "-m" , "flask", "run", "--host=0.0.0.0"]
+diff --git a/server/djangoproj/settings.py b/server/djangoproj/settings.py
+index 345d049..d1cedf7 100644
+--- a/server/djangoproj/settings.py
++++ b/server/djangoproj/settings.py
+@@ -14,6 +14,8 @@ https://docs.djangoproject.com/en/3.2/ref/settings/
+ import os
+ from pathlib import Path
+ 
++from django.core.exceptions import ImproperlyConfigured
++
+ # Build paths inside the project like this: BASE_DIR / 'subdir'.
+ BASE_DIR = Path(__file__).resolve().parent.parent
+ 
+@@ -21,22 +23,31 @@ BASE_DIR = Path(__file__).resolve().parent.parent
+ # Quick-start development settings - unsuitable for production
+ # See https://docs.djangoproject.com/en/3.2/howto/deployment/checklist/
+ 
+-# SECURITY WARNING: keep the secret key used in production secret!
+-SECRET_KEY = (
+-    "django-insecure-ccow$tz_=9%dxu4(0%^(z%nx32#s@(zt9$ih@)5l54yny)wm-0"
+-)
++
++def env_list(name, default=""):
++    """Read a comma-separated environment variable as a list."""
++    raw = os.environ.get(name, default)
++    return [item.strip() for item in raw.split(",") if item.strip()]
++
+ 
+ # SECURITY WARNING: don't run with debug turned on in production!
+-DEBUG = True
++# Defaults to True so local development keeps working; the production
++# docker-compose.yml sets DJANGO_DEBUG=false.
++DEBUG = os.environ.get("DJANGO_DEBUG", "true").lower() == "true"
+ 
+-ALLOWED_HOSTS = [
+-    "localhost",
+-    "mtoracinta-8000.theianext-1-labs-prod-misc-tools-us-east-0.proxy.cognitiveclass.ai",
+-]
+-CSRF_TRUSTED_ORIGINS = [
+-    "https://mtoracinta-8000.theiadockernext-0-labs-prod-theiak8s-4-tor01.proxy.cognitiveclass.ai",
+-    "https://mtoracinta-8000.theiadockernext-0-labs-prod-theiak8s-4-tor01.proxy.cognitiveclass.ai",
+-]
++# SECURITY WARNING: keep the secret key used in production secret!
++# It now comes from the environment instead of being committed to git.
++SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY")
++if not SECRET_KEY:
++    if DEBUG:
++        SECRET_KEY = "dev-only-insecure-key"
++    else:
++        raise ImproperlyConfigured(
++            "Set DJANGO_SECRET_KEY when DJANGO_DEBUG is false."
++        )
++
++ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1")
++CSRF_TRUSTED_ORIGINS = env_list("DJANGO_CSRF_TRUSTED_ORIGINS")
+ 
+ REST_FRAMEWORK = {
+     "DEFAULT_AUTHENTICATION_CLASSES": [],
+@@ -56,6 +67,8 @@ INSTALLED_APPS = [
+ 
+ MIDDLEWARE = [
+     "django.middleware.security.SecurityMiddleware",
++    # Serves /static/ files when running under gunicorn (DEBUG off).
++    "whitenoise.middleware.WhiteNoiseMiddleware",
+     "django.contrib.sessions.middleware.SessionMiddleware",
+     "django.middleware.common.CommonMiddleware",
+     "django.contrib.auth.middleware.AuthenticationMiddleware",
+@@ -94,7 +107,7 @@ WSGI_APPLICATION = "djangoproj.wsgi.application"
+ DATABASES = {
+     "default": {
+         "ENGINE": "django.db.backends.sqlite3",
+-        "NAME": BASE_DIR / "db.sqlite3",
++        "NAME": os.environ.get("SQLITE_PATH", BASE_DIR / "db.sqlite3"),
+     }
+ }
+ 
+diff --git a/server/entrypoint.sh b/server/entrypoint.sh
+index 863742d..12fbcfe 100644
+--- a/server/entrypoint.sh
++++ b/server/entrypoint.sh
+@@ -1,8 +1,9 @@
+ #!/bin/sh
+ 
+-# Make migrations and migrate the database.
+-echo "Making migrations and migrating the database. "
+-python manage.py makemigrations --noinput
++# Apply the migrations that are committed to git.
++# (We no longer run makemigrations here: new migrations should be created
++# during development, reviewed, and committed, not generated at startup.)
++echo "Migrating the database."
+ python manage.py migrate --noinput
+-python manage.py collectstatic --noinput
++
+ exec "$@"
+diff --git a/server/requirements.txt b/server/requirements.txt
+index cb435b2..7c76669 100644
+--- a/server/requirements.txt
++++ b/server/requirements.txt
+@@ -3,3 +3,4 @@ Django
+ Pillow
+ gunicorn
+ python-dotenv
++whitenoise

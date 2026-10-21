@@ -1,8 +1,9 @@
 #!/bin/sh
 
-# Make migrations and migrate the database.
-echo "Making migrations and migrating the database. "
-python manage.py makemigrations --noinput
+# Apply the migrations that are committed to git.
+# (We no longer run makemigrations here: new migrations should be created
+# during development, reviewed, and committed, not generated at startup.)
+echo "Migrating the database."
 python manage.py migrate --noinput
-python manage.py collectstatic --noinput
+
 exec "$@"
